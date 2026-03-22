@@ -56,6 +56,7 @@ typedef struct xspr_callback_s xspr_callback_t;
 typedef struct xspr_promise_s xspr_promise_t;
 typedef struct xspr_result_s xspr_result_t;
 typedef struct xspr_callback_queue_s xspr_callback_queue_t;
+typedef struct pxs_all_state_s pxs_all_state_t;
 
 typedef enum {
     XSPR_STATE_NONE,
@@ -82,7 +83,10 @@ typedef enum {
     XSPR_CALLBACK_CHAIN,
 
     // from a promise returned from a finally() callback
-    XSPR_CALLBACK_FINALLY_CHAIN
+    XSPR_CALLBACK_FINALLY_CHAIN,
+
+    // from all()
+    XSPR_CALLBACK_ALL
 } xspr_callback_type_t;
 
 struct xspr_callback_s {
@@ -106,7 +110,21 @@ struct xspr_callback_s {
             xspr_result_t* original_result;
             xspr_promise_t* chain_promise;
         } finally_chain;
+
+        struct {
+            pxs_all_state_t* state;
+            unsigned index;
+        } all;
     };
+};
+
+struct pxs_all_state_s {
+    xspr_promise_t* output;
+    unsigned total;
+    unsigned remaining;
+    bool done;
+    SV** results;   /* array[total] of AV refs, one per input */
+    int refs;
 };
 
 struct xspr_result_s {
@@ -145,8 +163,11 @@ struct xspr_callback_queue_s {
 xspr_callback_t* xspr_callback_new_perl(pTHX_ SV* on_resolve, SV* on_reject, xspr_promise_t* next);
 xspr_callback_t* xspr_callback_new_chain(pTHX_ xspr_promise_t* chain);
 xspr_callback_t* xspr_callback_new_finally_chain(pTHX_ xspr_result_t* original_result, xspr_promise_t* next_promise);
+xspr_callback_t* xspr_callback_new_all(pTHX_ pxs_all_state_t* state, unsigned index);
 void xspr_callback_process(pTHX_ xspr_callback_t* callback, xspr_promise_t* origin);
 void xspr_callback_free(pTHX_ xspr_callback_t* callback);
+
+void pxs_all_state_decref(pTHX_ pxs_all_state_t* state);
 
 xspr_promise_t* xspr_promise_new(pTHX);
 void xspr_promise_then(pTHX_ xspr_promise_t* promise, xspr_callback_t* callback);
@@ -348,6 +369,43 @@ void xspr_callback_process(pTHX_ xspr_callback_t* callback, xspr_promise_t* orig
             xspr_promise_finish(aTHX_ next_promise, result);
         }
 
+    } else if (callback->type == XSPR_CALLBACK_ALL) {
+        pxs_all_state_t* state = callback->all.state;
+        unsigned index = callback->all.index;
+
+        if (state->done) {
+            /* Already finished - suppress unhandled rejection warnings */
+            if (RESULT_IS_REJECTED(origin->finished.result)) {
+                origin->finished.result->rejection_should_warn = false;
+            }
+        } else if (RESULT_IS_RESOLVED(origin->finished.result)) {
+            /* Store results for this index as an AV ref */
+            AV* av = newAV();
+            unsigned i;
+            for (i = 0; i < (unsigned)origin->finished.result->count; i++) {
+                av_push(av, SvREFCNT_inc(origin->finished.result->results[i]));
+            }
+            state->results[index] = newRV_noinc((SV*)av);
+
+            if (--(state->remaining) == 0) {
+                /* All promises resolved - build final result */
+                state->done = true;
+                xspr_result_t* result = xspr_result_new(aTHX_ XSPR_RESULT_RESOLVED, state->total);
+                unsigned j;
+                for (j = 0; j < state->total; j++) {
+                    result->results[j] = SvREFCNT_inc(state->results[j]);
+                }
+                xspr_promise_finish(aTHX_ state->output, result);
+                xspr_result_decref(aTHX_ result);
+            }
+        } else {
+            ASSUME(RESULT_IS_REJECTED(origin->finished.result));
+            /* First rejection - propagate and mark handled */
+            state->done = true;
+            origin->finished.result->rejection_should_warn = false;
+            xspr_promise_finish(aTHX_ state->output, origin->finished.result);
+        }
+
     } else {
         ASSUME(0);
     }
@@ -373,6 +431,9 @@ void xspr_callback_free(pTHX_ xspr_callback_t *callback)
     } else if (callback->type == XSPR_CALLBACK_FINALLY_CHAIN) {
         xspr_promise_decref(aTHX_ callback->finally_chain.chain_promise);
         xspr_result_decref(aTHX_ callback->finally_chain.original_result);
+
+    } else if (callback->type == XSPR_CALLBACK_ALL) {
+        pxs_all_state_decref(aTHX_ callback->all.state);
 
     } else {
         ASSUME(0);
@@ -814,6 +875,29 @@ xspr_callback_t* xspr_callback_new_finally_chain(pTHX_ xspr_result_t* original_r
     callback->finally_chain.chain_promise = next_promise;
     xspr_promise_incref(aTHX_ next_promise);
 
+    return callback;
+}
+
+void pxs_all_state_decref(pTHX_ pxs_all_state_t* state)
+{
+    if (--(state->refs) == 0) {
+        xspr_promise_decref(aTHX_ state->output);
+        unsigned i;
+        for (i = 0; i < state->total; i++) {
+            if (state->results[i]) SvREFCNT_dec(state->results[i]);
+        }
+        Safefree(state->results);
+        Safefree(state);
+    }
+}
+
+xspr_callback_t* xspr_callback_new_all(pTHX_ pxs_all_state_t* state, unsigned index)
+{
+    xspr_callback_t* callback;
+    Newxz(callback, 1, xspr_callback_t);
+    callback->type = XSPR_CALLBACK_ALL;
+    callback->all.state = state;
+    callback->all.index = index;
     return callback;
 }
 
@@ -1424,6 +1508,68 @@ DESTROY(SV *self_sv)
 MODULE = Promise::XS     PACKAGE = Promise::XS::Promise
 
 PROTOTYPES: DISABLE
+
+SV*
+all(...)
+    CODE:
+        /* items includes the class/self as the first argument;
+           the actual promises start at ST(1). */
+        unsigned count = (unsigned)(items - 1);
+
+        if (count == 0) {
+            RETVAL = _create_preresolved_promise(aTHX_ NULL, 0, false);
+        } else {
+            xspr_promise_t* output = create_promise(aTHX);
+
+            pxs_all_state_t* state;
+            Newxz(state, 1, pxs_all_state_t);
+            state->output  = output;
+            xspr_promise_incref(aTHX_ output);  /* state holds one ref */
+            state->total     = count;
+            state->remaining = count;
+            state->done      = false;
+            state->refs      = 1;               /* our initial ref */
+            Newxz(state->results, count, SV*);
+
+            unsigned i;
+            for (i = 0; i < count; i++) {
+                SV* input_sv = ST(i + 1);
+                xspr_promise_t* input_promise = xspr_promise_from_sv(aTHX_ input_sv);
+
+                if (input_promise == NULL) {
+                    /* Plain scalar - treat as already resolved */
+                    AV* av = newAV();
+                    av_push(av, newSVsv(input_sv));
+                    state->results[i] = newRV_noinc((SV*)av);
+
+                    if (--(state->remaining) == 0 && !state->done) {
+                        state->done = true;
+                        xspr_result_t* result = xspr_result_new(aTHX_ XSPR_RESULT_RESOLVED, state->total);
+                        unsigned j;
+                        for (j = 0; j < state->total; j++) {
+                            result->results[j] = SvREFCNT_inc(state->results[j]);
+                        }
+                        xspr_promise_finish(aTHX_ output, result);
+                        xspr_result_decref(aTHX_ result);
+                    }
+                } else {
+                    /* Promise - register a callback */
+                    state->refs++;  /* callback will own this ref */
+                    xspr_callback_t* callback = xspr_callback_new_all(aTHX_ state, i);
+                    xspr_promise_then(aTHX_ input_promise, callback);
+                    xspr_promise_decref(aTHX_ input_promise);
+                }
+            }
+
+            /* Release our initial ref; state is kept alive by callbacks */
+            pxs_all_state_decref(aTHX_ state);
+
+            /* _promise_to_sv takes ownership of the original refs=1 from create_promise */
+            RETVAL = _promise_to_sv(aTHX_ output);
+            /* Do NOT decref output here - RETVAL's DESTROY will do it */
+        }
+    OUTPUT:
+        RETVAL
 
 void
 then(SV* self_sv, SV* on_resolve = NULL, SV* on_reject = NULL)
