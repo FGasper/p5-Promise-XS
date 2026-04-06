@@ -163,11 +163,12 @@ struct xspr_callback_queue_s {
 xspr_callback_t* xspr_callback_new_perl(pTHX_ SV* on_resolve, SV* on_reject, xspr_promise_t* next);
 xspr_callback_t* xspr_callback_new_chain(pTHX_ xspr_promise_t* chain);
 xspr_callback_t* xspr_callback_new_finally_chain(pTHX_ xspr_result_t* original_result, xspr_promise_t* next_promise);
-xspr_callback_t* xspr_callback_new_all(pTHX_ pxs_all_state_t* state, unsigned index);
 void xspr_callback_process(pTHX_ xspr_callback_t* callback, xspr_promise_t* origin);
 void xspr_callback_free(pTHX_ xspr_callback_t* callback);
 
+xspr_callback_t* xspr_callback_new_all(pTHX_ pxs_all_state_t* state, unsigned index);
 void pxs_all_state_decref(pTHX_ pxs_all_state_t* state);
+void pxs_all_state_finish_resolved(pTHX_ pxs_all_state_t* state);
 
 /* Guard used by SAVEDESTRUCTOR_X to free partially-initialised all() state
    on exception (croak/die).  Both pointers must be set to NULL once they
@@ -399,16 +400,10 @@ void xspr_callback_process(pTHX_ xspr_callback_t* callback, xspr_promise_t* orig
             }
             state->results[index] = newRV_noinc((SV*)av);
 
-            if (--(state->remaining) == 0) {
-                /* All promises resolved - build final result */
+            state->remaining--;
+            if (state->remaining == 0) {
                 state->done = true;
-                xspr_result_t* result = xspr_result_new(aTHX_ XSPR_RESULT_RESOLVED, state->total);
-                unsigned j;
-                for (j = 0; j < state->total; j++) {
-                    result->results[j] = SvREFCNT_inc(state->results[j]);
-                }
-                xspr_promise_finish(aTHX_ state->output, result);
-                xspr_result_decref(aTHX_ result);
+                pxs_all_state_finish_resolved(aTHX_ state);
             }
         } else {
             ASSUME(RESULT_IS_REJECTED(origin->finished.result));
@@ -896,9 +891,24 @@ xspr_callback_t* xspr_callback_new_finally_chain(pTHX_ xspr_result_t* original_r
     return callback;
 }
 
+void pxs_all_state_finish_resolved(pTHX_ pxs_all_state_t* state)
+{
+    xspr_result_t* result = xspr_result_new(aTHX_ XSPR_RESULT_RESOLVED, state->total);
+    unsigned i;
+
+    for (i = 0; i < state->total; i++) {
+        result->results[i] = SvREFCNT_inc(state->results[i]);
+    }
+
+    xspr_promise_finish(aTHX_ state->output, result);
+    xspr_result_decref(aTHX_ result);
+}
+
 void pxs_all_state_decref(pTHX_ pxs_all_state_t* state)
 {
-    if (--(state->refs) == 0) {
+    state->refs--;
+
+    if (state->refs == 0) {
         xspr_promise_decref(aTHX_ state->output);
         unsigned i;
         for (i = 0; i < state->total; i++) {
@@ -1562,18 +1572,20 @@ all(...)
             SAVEDESTRUCTOR_X(_pxs_all_guard_cleanup, guard);
 
             xspr_promise_t* output = create_promise(aTHX);
-            guard->output = output;  /* protect until _promise_to_sv */
 
             pxs_all_state_t* state;
             Newxz(state, 1, pxs_all_state_t);
-            guard->state = state;    /* protect until pxs_all_state_decref */
-
-            state->output  = output;
+            *guard = (pxs_all_guard_t) {
+                .output = output,
+                .state = state,
+            };
+            *state = (pxs_all_state_t) {
+                .output = output,
+                .total = count,
+                .remaining = count,
+                .refs = 1,
+            };
             xspr_promise_incref(aTHX_ output);  /* state holds one ref */
-            state->total     = count;
-            state->remaining = count;
-            state->done      = false;
-            state->refs      = 1;               /* our initial ref */
             Newxz(state->results, count, SV*);
 
             unsigned i;
@@ -1587,15 +1599,11 @@ all(...)
                     av_push(av, newSVsv(input_sv));
                     state->results[i] = newRV_noinc((SV*)av);
 
-                    if (--(state->remaining) == 0 && !state->done) {
+                    state->remaining--;
+
+                    if (state->remaining == 0 && !state->done) {
                         state->done = true;
-                        xspr_result_t* result = xspr_result_new(aTHX_ XSPR_RESULT_RESOLVED, state->total);
-                        unsigned j;
-                        for (j = 0; j < state->total; j++) {
-                            result->results[j] = SvREFCNT_inc(state->results[j]);
-                        }
-                        xspr_promise_finish(aTHX_ output, result);
-                        xspr_result_decref(aTHX_ result);
+                        pxs_all_state_finish_resolved(aTHX_ state);
                     }
                 } else {
                     /* Keep the callback guarded until xspr_promise_then()
