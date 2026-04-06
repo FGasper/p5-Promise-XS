@@ -166,9 +166,9 @@ xspr_callback_t* xspr_callback_new_finally_chain(pTHX_ xspr_result_t* original_r
 void xspr_callback_process(pTHX_ xspr_callback_t* callback, xspr_promise_t* origin);
 void xspr_callback_free(pTHX_ xspr_callback_t* callback);
 
-xspr_callback_t* xspr_callback_new_all(pTHX_ pxs_all_state_t* state, unsigned index);
-void pxs_all_state_decref(pTHX_ pxs_all_state_t* state);
-void pxs_all_state_finish_resolved(pTHX_ pxs_all_state_t* state);
+static xspr_callback_t* xspr_callback_new_all(pTHX_ pxs_all_state_t* state, unsigned index);
+static void pxs_all_state_decref(pTHX_ pxs_all_state_t* state);
+static void pxs_all_state_finish_resolved(pTHX_ pxs_all_state_t* state);
 
 /* Guard used by SAVEDESTRUCTOR_X to free partially-initialised all() state
    on exception (croak/die).  Both pointers must be set to NULL once they
@@ -891,7 +891,7 @@ xspr_callback_t* xspr_callback_new_finally_chain(pTHX_ xspr_result_t* original_r
     return callback;
 }
 
-void pxs_all_state_finish_resolved(pTHX_ pxs_all_state_t* state)
+static void pxs_all_state_finish_resolved(pTHX_ pxs_all_state_t* state)
 {
     xspr_result_t* result = xspr_result_new(aTHX_ XSPR_RESULT_RESOLVED, state->total);
     unsigned i;
@@ -904,7 +904,7 @@ void pxs_all_state_finish_resolved(pTHX_ pxs_all_state_t* state)
     xspr_result_decref(aTHX_ result);
 }
 
-void pxs_all_state_decref(pTHX_ pxs_all_state_t* state)
+static void pxs_all_state_decref(pTHX_ pxs_all_state_t* state)
 {
     state->refs--;
 
@@ -936,7 +936,7 @@ static void _pxs_callback_guard_cleanup(pTHX_ void* vp)
     Safefree(g);
 }
 
-xspr_callback_t* xspr_callback_new_all(pTHX_ pxs_all_state_t* state, unsigned index)
+static xspr_callback_t* xspr_callback_new_all(pTHX_ pxs_all_state_t* state, unsigned index)
 {
     xspr_callback_t* callback;
     Newxz(callback, 1, xspr_callback_t);
