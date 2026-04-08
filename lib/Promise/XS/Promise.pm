@@ -30,9 +30,10 @@ these methods:
 
 … which behave as they normally do in promise implementations.
 
-Additionally, C<all()> and C<race()> may be used, thus:
+Additionally, C<all()>, C<all_catch()> and C<race()> may be used, thus:
 
     my $p3 = Promise::XS::Promise->all( $p1, $p2, .. );
+    my $p3 = Promise::XS::Promise->all_catch( $p1, $p2, .. );
     my $p3 = Promise::XS::Promise->race( $p1, $p2, .. );
 
 … or, just:
@@ -46,6 +47,14 @@ Additionally, C<all()> and C<race()> may be used, thus:
     my $p3 = $p1->race( $p1, $p2, .. );
 
 (Note the repetition of $p1 in these last examples!)
+
+Please note that C<all()> catches only the very first rejection; any further rejections
+fall through unhandled.
+
+The variant C<all_catch()> either resolves with an arrayref of all given promises'
+resolution values (like C<all()>), or rejects with an arrayref of all rejected
+promises (unlike C<all()>).
+
 
 =head1 NOTES
 
@@ -68,6 +77,28 @@ sub all {
     }
 
     return $all_done;
+}
+
+# variant thereof which resolves with all results (as arrayref)
+# or rejects with all rejections (as arrayref)
+sub all_catch
+{
+  my $all_done = Promise::XS::resolved();
+
+  for my $p (@_[1 .. $#_])
+  {
+    my @results;
+    $all_done = $all_done->then(
+      sub {
+        @results = @_;
+        return $p;
+      } )->then( sub { (@results, [ 1, @_ ]) },
+                 sub { (@results, [ 0, @_ ]) } );
+  }
+  return $all_done->then(sub {
+    my @failures = grep(!$_->[0],@_);
+    return (@failures? Promise::XS::rejected(map { $_->[1] } (@failures))
+            : (map { $_->[1] } (@_))); });
 }
 
 # Lifted from Promise::ES6

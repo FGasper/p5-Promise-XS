@@ -35,6 +35,10 @@ The following aggregator functions are exposed:
     # Non-promises will be passed through as resolve values.
     my $all_p = Promise::XS::all( $promise1, $promise2, 'abc' .. );
 
+    # Resolves just like all(), but rejects with an arrayref
+    # of all rejected promises (all() catches only the first rejection)
+    my $catch_all_p = Promise::XS::all_catch( $p1, $p2, 'abc' .. );
+
     # Resolves/rejects with the results from the first
     # resolved or rejected promise.
     my $race_p = Promise::XS::race( $promise3, $promise4, .. );
@@ -308,6 +312,10 @@ sub _convert_to_our_promise {
 # Aggregator functions
 sub all {
     return Promise::XS::Promise->all(@_);
+}
+
+sub all_catch {
+    return Promise::XS::Promise->all_catch(@_);
 }
 
 sub race {
